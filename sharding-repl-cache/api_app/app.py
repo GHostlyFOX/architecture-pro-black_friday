@@ -13,7 +13,7 @@ from fastapi_cache.decorator import cache
 from logmiddleware import RouterLoggingMiddleware, logging_config
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from pydantic.functional_validators import BeforeValidator
-from pymongo import errors
+from pymongo import ASCENDING, errors
 from redis import asyncio as aioredis
 from typing_extensions import Annotated
 
@@ -59,6 +59,10 @@ async def startup():
         redis = aioredis.from_url(REDIS_URL, encoding="utf8", decode_responses=True)
         FastAPICache.init(RedisBackend(redis), prefix="api:cache")
 
+    collection_names = await db.list_collection_names()
+    for collection_name in collection_names:
+        collection = db.get_collection(collection_name)
+        await collection.create_index([("name", ASCENDING)], unique=True)
 
 class UserModel(BaseModel):
     """
@@ -142,14 +146,16 @@ async def collection_count(collection_name: str):
     response_model_by_alias=False,
 )
 @cache(expire=60 * 1)
-async def list_users(collection_name: str):
+async def list_users(collection_name: str, skip: int = 0, limit: int = 100):
     """
     List all of the user data in the database.
-    The response is unpaginated and limited to 1000 results.
+    The response is unpaginated and limited to 100 results.
     """
     time.sleep(1)
     collection = db.get_collection(collection_name)
-    return UserCollection(users=await collection.find().to_list(1000))
+    return UserCollection(
+        users=await collection.find().skip(skip).limit(limit).to_list(limit)
+    )
 
 
 @app.get(
@@ -184,8 +190,16 @@ async def create_user(collection_name: str, user: UserModel = Body(...)):
     A unique `id` will be created and provided in the response.
     """
     collection = db.get_collection(collection_name)
-    new_user = await collection.insert_one(
-        user.model_dump(by_alias=True, exclude=["id"])
-    )
-    created_user = await collection.find_one({"_id": new_user.inserted_id})
-    return created_user
+    try:
+        # Create index if it does not exist
+        await collection.create_index([("name", ASCENDING)], unique=True)
+        new_user = await collection.insert_one(
+            user.model_dump(by_alias=True, exclude=["id"])
+        )
+        created_user = await collection.find_one({"_id": new_user.inserted_id})
+        return created_user
+    except errors.DuplicateKeyError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"User with name {user.name} already exists",
+        )
